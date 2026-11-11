@@ -1,0 +1,4 @@
+# Copy to flow.local.yml. Values below are placeholders, not usable endpoints.
+provider: null
+repositories:
+  app: /absolute/path/to/your-project

@@ -1,0 +1,19 @@
+.DS_Store
+.tmp/
+.venv/
+__pycache__/
+*.pyc
+.specify/flow.lock
+.specify/notifications.local.json
+.specify/notifications/
+
+# Personal GitHub contains framework only. Business records stay on this machine.
+/specs/
+/.specify/workflows/runs/
+/.specify/*.local.*
+/.specify/*.lock
+/.specify/*.yml
+!/.specify/flow.example.yml
+/流程重构/
+/需求-进行中/
+/需求-归档/

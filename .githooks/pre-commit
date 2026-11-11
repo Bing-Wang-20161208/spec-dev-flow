@@ -1,0 +1,4 @@
+#!/bin/sh
+framework_python=.venv/bin/python
+[ -x "$framework_python" ] || framework_python=python3
+exec "$framework_python" scripts/repo_guard.py --index
