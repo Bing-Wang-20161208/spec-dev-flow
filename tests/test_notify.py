@@ -214,6 +214,98 @@ class FlowNotificationTests(test_flow.FlowFixture):
         self.assertEqual(code, 0)
         self.assertEqual(result['notification']['status'], 'preview')
 
+    def request(self, target, key='acceptance', summary='确认验收规则'):
+        return self.cli('request-decision', self.feature_arg, target, '--key', key,
+                        '--summary', summary, '--next', '回复适用范围', '--thread', 'fixture-thread')[1]
+
+    def test_review_request_saves_before_delivery_and_deduplicates_by_spec_version(self):
+        (self.f / 'plan.md').unlink()
+        (self.f / 'tasks.md').unlink()
+        version = flow.spec_version(self.f)
+        notify.init_config(self.root)
+        (self.root / notify.CONFIG).write_text(json.dumps({'webhook': 'https://open.feishu.cn/open-apis/bot/v2/hook/fixture'}))
+
+        def post(config, data):
+            spec, _ = flow.document(self.f / 'spec.md')
+            self.assertEqual(spec['pending_decisions']['acceptance']['version'], flow.spec_version(self.f))
+            self.assertNotIn('review_approval', spec)
+            with flow.locked():
+                pass
+            return {'status': 'sent'}
+
+        with patch.object(notify, 'post', side_effect=post) as send:
+            self.assertEqual(self.request('review')['notification']['status'], 'sent')
+            self.assertEqual(flow.spec_version(self.f), version)
+            self.assertEqual(self.request('review', summary='换个说法')['notification']['status'], 'suppressed')
+            with (self.f / 'spec.md').open('a') as document:
+                document.write('\n增加验收样例。\n')
+            self.assertEqual(self.request('review')['notification']['status'], 'sent')
+            self.assertEqual(send.call_count, 2)
+        self.approve('review')
+        self.assertNotIn('pending_decisions', flow.document(self.f / 'spec.md')[0])
+
+    def test_plan_request_before_tasks_uses_plan_version(self):
+        self.approve('review')
+        (self.f / 'tasks.md').unlink()
+        spec_version, version = flow.versions(self.f)
+        with patch.object(notify, 'deliver', return_value={'status': 'not_configured'}) as send:
+            result = self.request('plan')
+        self.assertEqual(result['notification']['status'], 'not_configured')
+        self.assertEqual(flow.versions(self.f), (spec_version, version))
+        self.assertEqual(send.call_args.args[0]['version'], version)
+        self.assertEqual(flow.document(self.f / 'plan.md')[0]['pending_decisions']['acceptance']['version'], version)
+        self.write_tasks(self.task())
+        self.approve('plan')
+        self.assertNotIn('pending_decisions', flow.document(self.f / 'plan.md')[0])
+
+    def test_task_request_blocks_execution_even_when_notification_is_unknown(self):
+        self.approve_all()
+        self.evidence()
+        versions = flow.versions(self.f)
+
+        def deliver(event, **kwargs):
+            task = flow.tasks(self.f)['T001']
+            self.assertEqual(task['状态'], '等待用户')
+            self.assertEqual(task['待确认标识'], 'acceptance')
+            self.assertEqual(task['阻塞'], '确认验收规则')
+            self.assertEqual(task['下一步'], '回复适用范围')
+            self.assertEqual(event['key'], 'T001:acceptance')
+            self.assertEqual(event['thread'], 'fixture-thread')
+            return {'status': 'unknown'}
+
+        with patch.object(notify, 'deliver', side_effect=deliver):
+            self.assertEqual(self.request('T001')['notification']['status'], 'unknown')
+        self.assertEqual(flow.versions(self.f), versions)
+        with patch.object(flow, 'alive_group', return_value=False), \
+             patch.object(flow.subprocess, 'Popen') as spawn:
+            with self.assertRaisesRegex(flow.FlowError, '等待用户决定'):
+                self.cli('run', self.feature_arg, 'T001', '--phase', 'test', '--command', 'python -m unittest')
+            spawn.assert_not_called()
+        with self.assertRaisesRegex(flow.FlowError, '等待用户决定'):
+            self.complete()
+        self.cli('note', self.feature_arg, 'T001', '--status', '测试中', '--next', '按已记录的答复验证')
+        self.assertNotIn('待确认标识', flow.tasks(self.f)['T001'])
+        self.assertEqual(flow.versions(self.f), versions)
+
+    def test_unavailable_api_records_waiting_without_dispatching_or_notifying(self):
+        self.write_tasks(self.task(kinds=('联调', '总体验证')))
+        self.edit_meta('plan.md', api={'confirmed': True, 'needed': True, 'mock': False,
+                                       'real_ready': False, 'openapi': 'openapi.yml'})
+        self.approve_all()
+        versions = flow.versions(self.f)
+        with patch.object(flow, 'alive_group', return_value=False), \
+             patch.object(flow.subprocess, 'Popen') as spawn, \
+             patch.object(notify, 'deliver') as send:
+            with self.assertRaisesRegex(flow.FlowError, '已记录等待接口'):
+                self.cli('run', self.feature_arg, 'T001', '--phase', 'test', '--command', 'python -m unittest')
+            spawn.assert_not_called()
+            send.assert_not_called()
+        task = flow.tasks(self.f)['T001']
+        self.assertEqual(task['状态'], '等待接口')
+        self.assertEqual(task['阻塞'], '真实接口尚不可用')
+        self.assertIn('接续联调', task['下一步'])
+        self.assertEqual(flow.versions(self.f), versions)
+
     def test_completion_real_delivery_path_deduplicates_same_validated_code(self):
         self.approve_all()
         self.evidence()

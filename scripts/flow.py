@@ -10,7 +10,7 @@ import notify
 ROOT = Path(__file__).resolve().parents[1]
 STATUSES = {'待开发', '开发中', '测试中', '已完成', '异常', '等待用户', '等待接口'}
 FIELDS = ('仓库', '范围', '依赖', '类型', '独立检查', '验证命令', '状态', '下一步', '阻塞', '证据')
-VOLATILE = {'状态', '下一步', '阻塞', '证据', '最近执行'}
+VOLATILE = {'状态', '下一步', '阻塞', '证据', '最近执行', '待确认标识'}
 class FlowError(Exception): pass
 
 def require(ok, message):
@@ -80,22 +80,28 @@ def update_task(f, task_id, **changes):
         else:block=block.rstrip()+'\n  - '+key+'：'+rendered+'\n\n'
     if '状态' in changes:
         block=re.sub(r'^- \[[ xX]\]', '- [x]' if changes['状态']=='已完成' else '- [ ]',block,count=1)
+        if changes['状态'] != '等待用户':
+            block = re.sub(r'^  - 待确认标识：[^\n]*\n', '', block, flags=re.M)
     atomic(f/'tasks.md',text[:t['start']]+block+text[t['end']:])
 
 def spec_version(f):
     spec,body=document(f/'spec.md')
-    sm={k:v for k,v in spec.items() if k not in ('review_approval','release','development_status','final_verification')}
+    sm={k:v for k,v in spec.items() if k not in ('review_approval','pending_decisions','release','development_status','final_verification')}
     return digest(json.dumps(sm,ensure_ascii=False,sort_keys=True)+body)
 
-def versions(f):
-    spec,sbody=document(f/'spec.md');plan,pbody=document(f/'plan.md')
-    pm={k:v for k,v in plan.items() if k!='plan_approval'}
+def plan_version(f, sv):
+    plan, body = document(f/'plan.md')
+    pm = {k: v for k, v in plan.items() if k not in ('plan_approval', 'pending_decisions')}
     # Availability is user-provided operational data; business/interface changes remain in the plan body.
     if isinstance(pm.get('api'),dict):pm['api']={k:v for k,v in pm['api'].items() if k not in ('real_ready','base_url','readiness_source')}
-    defs=[{k:v for k,v in t.items() if k not in VOLATILE|{'checked','start','end','block'}} for t in tasks(f).values()]
-    sv=spec_version(f)
-    pv=digest(sv+json.dumps(pm,ensure_ascii=False,sort_keys=True)+pbody+json.dumps(defs,ensure_ascii=False,sort_keys=True))
-    return sv,pv
+    definitions = tasks(f) if (f/'tasks.md').is_file() else {}
+    defs = [{k: v for k, v in t.items() if k not in VOLATILE|{'checked','start','end','block'}}
+            for t in definitions.values()]
+    return digest(sv+json.dumps(pm,ensure_ascii=False,sort_keys=True)+body+json.dumps(defs,ensure_ascii=False,sort_keys=True))
+
+def versions(f):
+    sv = spec_version(f)
+    return sv, plan_version(f, sv)
 
 def configured_repos():
     d=yaml.safe_load((ROOT/'.specify/flow.local.yml').read_text())
@@ -286,8 +292,12 @@ def execute(args):
         spec,plan,ts,repos,sv,pv=validate(f,True);require(args.task in ts,'任务不存在');t=ts[args.task];repo=repos[t['仓库']]
         require(not t['checked'],'任务已完成；如需变更先更新范围并重新确认')
         require(all(ts[x]['checked'] for x in t['依赖']),'前置任务未完成')
-        if '联调' in t['类型']:require(plan['api'].get('real_ready') is True,'真实接口尚不可用，保存等待接口状态')
+        require(t['状态'] != '等待用户', '任务等待用户决定；记录回复并更新状态后再执行')
         problem=args.problem or t['id'];history=history_check(f,t,problem,args.phase,args.repair,args.upgrade,args.replan)
+        if '联调' in t['类型'] and plan['api'].get('real_ready') is not True:
+            update_task(f, t['id'], 状态='等待接口', 下一步='用户提供真实接口就绪信息和地址后接续联调',
+                        阻塞='真实接口尚不可用')
+            raise FlowError('真实接口尚不可用，已记录等待接口')
         prev=next((d for d in reversed(history) if d['task_id']==t['id'] and d['problem_id']==problem),None)
         if args.previous:
             prev=next((x for x in history if x['attempt_id']==args.previous),None)
@@ -394,6 +404,7 @@ def approval(args):
         p=f/('spec.md' if args.node=='review' else 'plan.md');meta,body=document(p)
         require(args.quote.strip() and args.source.strip(),'确认必须有用户原话与来源')
         meta['review_approval' if args.node=='review' else 'plan_approval']={'version':sv if args.node=='review' else pv,'quote':args.quote,'source':args.source,'at':now()}
+        meta.pop('pending_decisions', None)
         write_document(p,meta,body)
     return {'node':args.node,'version':sv if args.node=='review' else pv}
 
@@ -404,6 +415,7 @@ def completed(args):
         require(not any(d['outcome']=='pending' for d in history),'有未核对执行，不能完成')
         if args.task:
             require(args.task in ts,'任务不存在');t=ts[args.task];repo=repos[t['仓库']]
+            require(t['状态'] != '等待用户', '任务等待用户决定；记录回复并更新状态后再完成')
             require(all(ts[x]['checked'] for x in t['依赖']),'依赖尚未完成')
             current=context_version(f,repo,t)
             good=[d for d in history if d['task_id']==t['id'] and d['outcome']=='passed' and d['context_version']==current and d.get('after_context')==current]
@@ -465,15 +477,52 @@ def assess(args):
         d.update(progress=True,progress_reason=args.reason,progress_evidence=str(proof.relative_to(f)))
         put(p,d);return {'assessed':args.attempt,'progress':True}
 
+def attention_event(f, args, version, key):
+    return {'kind': 'attention', 'source': str(f.relative_to(ROOT)),
+            'key': key, 'version': version, 'title': f.name,
+            'summary': args.summary.strip(), 'next': args.next.strip(), 'thread': args.thread}
+
+def request_decision(args):
+    f = feature(args.feature)
+    key = args.key.strip()
+    summary, next_step = args.summary.strip(), args.next.strip()
+    require(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', key), '需要稳定的问题标识（字母、数字、点、下划线或连字符）')
+    require(summary and next_step, '需要问题摘要和用户要处理的事项')
+    target = args.target
+    with locked():
+        if target in ('review', 'plan'):
+            path = f/('spec.md' if target == 'review' else 'plan.md')
+            version = spec_version(f)
+            if target == 'plan':
+                version = plan_version(f, version)
+            meta, body = document(path)
+            approval = meta.get('review_approval' if target == 'review' else 'plan_approval', {})
+            require(approval.get('version') != version, '当前版本已经确认；先把需要重新确认的实质变更写入文档')
+            pending = meta.setdefault('pending_decisions', {})
+            entry = {'version': version, 'summary': summary, 'next': next_step}
+            if pending.get(key) != entry:
+                pending[key] = entry
+                write_document(path, meta, body)
+        else:
+            require(re.fullmatch(r'T\d+', target), '确认位置必须是 review、plan 或任务 ID')
+            require(len(summary.splitlines()) == len(next_step.splitlines()) == 1, '任务的摘要和下一步必须各为一行')
+            task = tasks(f).get(target)
+            require(task and not task['checked'], '任务不存在或已完成')
+            version = versions(f)[1]
+            if (task['状态'], task.get('待确认标识'), task['阻塞'], task['下一步']) != ('等待用户', key, summary, next_step):
+                update_task(f, target, 状态='等待用户', 待确认标识=key, 阻塞=summary, 下一步=next_step)
+            key = f'{target}:{key}'
+        event = attention_event(f, args, version, key)
+    notification = notify.deliver(event, root=ROOT)
+    return {'target': target, 'status': '等待用户', 'version': version, 'notification': notification}
+
 def notify_attention(args):
     f=feature(args.feature)
     require(args.key.strip() and args.summary.strip() and args.next.strip(), '通知需要稳定问题标识、摘要与下一步')
     # Review can happen before plan/tasks exist. Version the available authoritative material.
     with locked():
         version=versions(f)[1] if (f/'plan.md').is_file() and (f/'tasks.md').is_file() else spec_version(f)
-        event={'kind':'attention','source':str(f.relative_to(ROOT)),
-            'key':args.key,'version':version,'title':f.name,'summary':args.summary,
-            'next':args.next,'thread':args.thread}
+        event = attention_event(f, args, version, args.key.strip())
     return notify.deliver(event,root=ROOT,dry_run=args.dry_run)
 
 def main():
@@ -484,12 +533,16 @@ def main():
     a=sub.add_parser('run');a.add_argument('feature');a.add_argument('task');a.add_argument('--phase',choices=['implement','test','review'],required=True);a.add_argument('--problem');a.add_argument('--model');a.add_argument('--effort');a.add_argument('--why');a.add_argument('--command');a.add_argument('--timeout',type=int,default=300);a.add_argument('--resume');a.add_argument('--previous');
     for name in ('repair','upgrade','replan'):a.add_argument('--'+name,action='store_true')
     a=sub.add_parser('complete');a.add_argument('feature');a.add_argument('--task');a.add_argument('--thread',default='')
+    a=sub.add_parser('request-decision', help='写入待确认事项并发送飞书提醒')
+    a.add_argument('feature');a.add_argument('target', metavar='review|plan|Txxx')
+    a.add_argument('--key', required=True);a.add_argument('--summary', required=True)
+    a.add_argument('--next', required=True);a.add_argument('--thread', default='')
     a=sub.add_parser('notify',help='保存原生待确认/停止记录后，显式通知用户介入')
     a.add_argument('feature');a.add_argument('--key',required=True);a.add_argument('--summary',required=True)
     a.add_argument('--next',required=True);a.add_argument('--thread',default='');a.add_argument('--dry-run',action='store_true')
     for name in ('settle','assess'):
         a=sub.add_parser(name);a.add_argument('feature');a.add_argument('attempt');a.add_argument('--evidence',required=True);a.add_argument('--reason',required=True)
-    a=sub.add_parser('note');a.add_argument('feature');a.add_argument('task');a.add_argument('--status',choices=sorted(STATUSES-{'已完成'}),required=True);a.add_argument('--next',required=True);a.add_argument('--reason',default='无')
+    a=sub.add_parser('note');a.add_argument('feature');a.add_argument('task');a.add_argument('--status',choices=sorted(STATUSES-{'已完成', '等待用户'}),required=True,help='等待用户请用 request-decision');a.add_argument('--next',required=True);a.add_argument('--reason',default='无')
     args=p.parse_args()
     if args.action=='models':
         items,meta=discover();result={**meta,'models':[{k:m.get(k) for k in ('slug','display_name','visibility','supported_reasoning_levels','input_modalities')} for m in items if m.get('visibility')=='list']}
@@ -502,6 +555,7 @@ def main():
         if not args.task:
             event=result.pop('_notification_event');event['thread']=args.thread
             result['notification']=notify.deliver(event,root=ROOT)
+    elif args.action=='request-decision':result=request_decision(args)
     elif args.action=='notify':result={'notification':notify_attention(args)}
     elif args.action=='settle':result=settle(args)
     elif args.action=='assess':result=assess(args)
