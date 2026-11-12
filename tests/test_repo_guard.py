@@ -48,6 +48,7 @@ class RepositoryBoundaryTests(unittest.TestCase):
 
     def test_only_framework_paths_pass(self):
         self.write('README.md')
+        self.write('docs/workflow.md')
         self.write('scripts/flow.py')
         tip = self.commit()
         self.assertEqual(guard.check_index(), [])

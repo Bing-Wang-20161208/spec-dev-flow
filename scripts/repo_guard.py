@@ -11,6 +11,7 @@ import sys
 ALLOWED = {
     '.gitignore', '.python-version', 'AGENTS.md', 'README.md',
     'requirements.txt', 'requirements.lock', 'LICENSE', 'THIRD_PARTY_NOTICES.md',
+    'docs/configuration.md', 'docs/operations.md', 'docs/publishing.md', 'docs/workflow.md',
     '.githooks/pre-commit', '.githooks/pre-push',
     'scripts/flow.py', 'scripts/notify.py', 'scripts/repo_guard.py',
     'tests/test_flow.py', 'tests/test_notify.py', 'tests/test_repo_guard.py',
@@ -126,7 +127,7 @@ def main():
     args = parser.parse_args()
     problems = check_index() if args.index else check_push(sys.stdin)
     if problems:
-        print('拒绝提交/推送：个人 GitHub 仅允许已审核的框架路径。以下内容应仅保留本地：', file=sys.stderr)
+        print('拒绝提交/推送：当前框架仓库仅允许已审核的路径。以下内容应仅保留本地：', file=sys.stderr)
         for path in problems:
             print('  ' + path, file=sys.stderr)
         print('不要绕过检查；新增纯框架文件需先审核用途并更新白名单。', file=sys.stderr)
