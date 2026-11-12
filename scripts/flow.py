@@ -283,7 +283,7 @@ def phase_prompt(f,t,phase,problem):
     skill='speckit-implement' if phase=='implement' else 'speckit-analyze'
     if phase=='review':
         return f'''独立代码检查，只读代码。读取 {f}/spec.md、plan.md、tasks.md 和本目录 AGENTS.md。只检查 {t['id']}：{t['title']}，相关范围 {json.dumps(t['范围'],ensure_ascii=False)}。检查需求符合性、缺陷、回归及测试覆盖。不得修改任何文件。最后只输出 JSON 对象，字段 approved(boolean)、findings(array)、summary(string)。findings 每项必须是对象，含 severity(critical/high/medium/low/info)、blocking(boolean)、message(string)，无问题则为空数组。阻塞问题存在时 approved=false。'''
-    return f'''按原生技能执行当前明确限定的子任务。完整读取 {ROOT}/.agents/skills/{skill}/SKILL.md，读取当前代码目录的 AGENTS.md、命中的仓库规则，以及 {f}/spec.md、plan.md、tasks.md。只实施 {t['id']}：{t['title']}；相关范围 {json.dumps(t['范围'],ensure_ascii=False)}，问题 {problem}。其它任务只是依赖上下文，不得提前实施或勾选。不得修改需求中心文件；任务状态由主流程写回。需要原生路径检查时从 {ROOT} 执行 .specify/scripts/bash/check-prerequisites.sh --paths-only --json，避免写当前功能指针。不得以模板为由新增无关配置，不提交或推送。业务或验收含糊时停止并报告，工具同错首次后最多额外两次；不要自行委派或切模型。实际验证命令：{json.dumps(t['验证命令'],ensure_ascii=False)}。本次 CLI 成功不自动代表任务完成。最后只报告变更、实际验证、未解决问题及下一步，不写模型中间推理。'''
+    return f'''按原生技能执行当前明确限定的子任务。完整读取 {ROOT}/.agents/skills/{skill}/SKILL.md，读取当前代码目录的 AGENTS.md、命中的仓库规则，以及 {f}/spec.md、plan.md、tasks.md。只实施 {t['id']}：{t['title']}；相关范围 {json.dumps(t['范围'],ensure_ascii=False)}，问题 {problem}。其它任务只是依赖上下文，不得提前实施或勾选。不得修改需求中心文件；任务状态由主流程写回。需要原生路径检查时从 {ROOT} 执行 .specify/scripts/bash/check-prerequisites.sh --paths-only --json，避免写当前功能指针。不得以模板为由新增无关配置，不提交或推送。业务或验收含糊时停止并报告，工具同错首次后最多额外两次。实际验证命令：{json.dumps(t['验证命令'],ensure_ascii=False)}。本次 CLI 成功不自动代表任务完成。最后只报告变更、实际验证、未解决问题及下一步，不写模型中间推理。'''
 
 def execute(args):
     f=feature(args.feature)

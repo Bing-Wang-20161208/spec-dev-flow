@@ -504,6 +504,18 @@ class NativeResultContractTests(FlowFixture):
             self.complete()
 
 
+class ImplementationPromptTests(FlowFixture):
+    def test_prompt_leaves_internal_agent_orchestration_unspecified(self):
+        self.write_tasks(self.task())
+        prompt = flow.phase_prompt(
+            self.f, flow.tasks(self.f)['T001'], 'implement', 'T001'
+        )
+        self.assertIn('只实施 T001', prompt)
+        for phrase in ('自行委派', '切模型', '一层子 Agent', '最多两个'):
+            with self.subTest(phrase=phrase):
+                self.assertNotIn(phrase, prompt)
+
+
 class ReviewSchemaTests(unittest.TestCase):
     def test_string_finding_cannot_hide_a_blocking_issue(self):
         self.assertFalse(flow.review_ok({'approved':True,'findings':['P1: blocking defect'],'summary':'blocking issue'}))
