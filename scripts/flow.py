@@ -193,6 +193,123 @@ def records(f):
         d['_path']=p;result.append(d)
     return sorted(result,key=lambda x:x['started_at'])
 
+def model_observation(diagnostic='', *, response_received=False, stage='execution', elapsed=None):
+    category, status, basis = 'unknown', 'unknown', 'insufficient_evidence'
+    if response_received:
+        category, status, basis = None, 'succeeded', 'native_response_completed'
+    elif stage in ('catalog', 'selection'):
+        category, status, basis = stage, 'not_started', 'preflight_check'
+    elif stage in ('timeout', 'interrupted'):
+        category, basis = stage, 'execution_stopped'
+    else:
+        signatures = (
+            ('authentication', r'invalid_api_key|authenticationerror|incorrect api key|unexpected status (?:code[: ]*)?(?:401|403)\b'),
+            ('rate_limit', r'rate_limit_exceeded|ratelimiterror|unexpected status (?:code[: ]*)?429\b'),
+            ('model_unavailable', r'model_not_found|unknown model|model[^\n]{0,100}(?:not found|does not exist|not available)|unsupported model'),
+            ('tool_compatibility', r'(?:does not support|not supported|unsupported)[^\n]{0,60}(?:tool calls|tools|function calling)|(?:tool calls|tools|function calling)[^\n]{0,60}(?:not supported|unsupported)'),
+            ('connection', r'error sending request for url|upstream connect error|provider[^\n]{0,60}(?:connection refused|connection reset|timed out)'),
+        )
+        for candidate, pattern in signatures:
+            if re.search(pattern, diagnostic, re.I):
+                category, status, basis = candidate, 'failed', 'codex_event_signature'
+                break
+    return {'call_status': status, 'failure_category': category, 'basis': basis,
+            'stage': stage, 'elapsed_seconds': elapsed}
+
+def model_diagnostics(stdout):
+    messages = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('type') in ('error', 'turn.failed'):
+            messages.append(json.dumps(event.get('error', event.get('message')), ensure_ascii=False))
+    return '\n'.join(messages)
+
+def report_time(value):
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed.astimezone(dt.timezone.utc) if parsed.tzinfo else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+def model_report(args):
+    since = report_time(args.since) if args.since else None
+    until = report_time(args.until) if args.until else None
+    require(not args.since or since, '--since 需要带时区的 ISO 时间')
+    require(not args.until or until, '--until 需要带时区的 ISO 时间')
+    require(not (since and until) or since < until, '时间区间必须递增')
+    groups, sources, unreadable = {}, [], []
+    for path in sorted((ROOT/'specs').glob('*/evidence/*/*.json')):
+        if path.name not in ('result.json', 'model-check.json'):
+            continue
+        try:
+            record = read(path)
+            require(isinstance(record, dict), '执行记录必须是对象')
+            if record.get('phase') not in ('implement', 'review'):
+                continue
+            started = report_time(record.get('started_at'))
+            require(started is not None, '缺少有效执行时间')
+            if (since and started < since) or (until and started >= until):
+                continue
+            catalog = record.get('catalog') or {}
+            require(isinstance(catalog, dict), '模型目录元数据格式无效')
+            provider = record.get('provider') or catalog.get('provider') or 'unknown'
+            channel = record.get('execution_channel') or 'unknown'
+            model = record.get('model') or 'unknown'
+            effort = record.get('reasoning_effort') or 'unknown'
+            require(all(isinstance(item, str) for item in (provider, channel, model, effort)), '模型身份字段格式无效')
+            observation = record.get('model_observation')
+            require(observation is None or isinstance(observation, dict), '模型观测格式无效')
+            if observation is None:
+                observation = model_observation()
+                observation['basis'] = 'legacy_record'
+            status = observation.get('call_status', 'unknown')
+            require(status in ('succeeded', 'failed', 'unknown', 'not_started'), '模型调用状态无效')
+            category = observation.get('failure_category')
+            require(category is None or isinstance(category, str), '失败分类格式无效')
+            outcome = record.get('outcome', 'unknown')
+            require(isinstance(outcome, str), '执行结果格式无效')
+            elapsed = observation.get('elapsed_seconds')
+            if not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool) or not 0 <= elapsed < float('inf'):
+                finished = report_time(record.get('finished_at'))
+                elapsed = (finished-started).total_seconds() if finished and finished >= started else None
+            key = (channel, provider, model, record['phase'], effort)
+            group = groups.setdefault(key, {'execution_channel': channel, 'provider': provider,
+                'model': model, 'phase': record['phase'], 'reasoning_effort': effort,
+                'observations': 0, 'calls': dict.fromkeys(('succeeded', 'failed', 'unknown', 'not_started'), 0),
+                'task_outcomes': {}, 'failure_categories': {}, 'repair_attempts': 0,
+                'actual_model_unknown': 0, 'execution_duration_samples': 0,
+                'execution_duration_total_seconds': 0, 'preflight_duration_samples': 0,
+                'preflight_duration_total_seconds': 0})
+            group['observations'] += 1
+            group['calls'][status] += 1
+            group['task_outcomes'][outcome] = group['task_outcomes'].get(outcome, 0) + 1
+            if category:
+                group['failure_categories'][category] = group['failure_categories'].get(category, 0) + 1
+            group['repair_attempts'] += bool(record.get('repair'))
+            group['actual_model_unknown'] += record.get('actual_model') in (None, '', 'unknown')
+            duration_kind = 'preflight' if path.name == 'model-check.json' else 'execution'
+            if elapsed is not None:
+                group[duration_kind+'_duration_samples'] += 1
+                group[duration_kind+'_duration_total_seconds'] += elapsed
+            sources.append({'path': str(path.relative_to(ROOT)), 'started_at': record['started_at'],
+                            'call_status': status, 'classification_basis': observation.get('basis', 'unknown')})
+        except (OSError, ValueError, TypeError, FlowError):
+            unreadable.append(str(path.relative_to(ROOT)))
+    for group in groups.values():
+        denominator = group['calls']['succeeded'] + group['calls']['failed']
+        group['call_success_rate'] = {'numerator': group['calls']['succeeded'], 'denominator': denominator,
+                                      'value': group['calls']['succeeded']/denominator if denominator else None}
+        for kind in ('execution', 'preflight'):
+            count = group[kind+'_duration_samples']
+            total = group[kind+'_duration_total_seconds']
+            group[kind+'_duration_mean_seconds'] = total/count if count else None
+    return {'since': args.since, 'until': args.until, 'generated_at': now(),
+            'groups': [groups[key] for key in sorted(groups)], 'sources': sources,
+            'unreadable_records': unreadable}
+
 def alive_group(pgid):
     if not pgid:return False
     proc=subprocess.run(['ps','-axo','pgid=,stat='],capture_output=True,text=True,timeout=5)
@@ -312,11 +429,32 @@ def execute(args):
             state=read(inputs_file.parent/'state.json');require(state['status'] in ('paused','failed'),'仅 paused/failed 可原生 resume；running 使用 settle 后新建接续')
         model=None;effort=None;catalog=None
         if args.phase!='test':
-            require(args.model and args.why,'模型执行需要当前候选及选择依据')
-            items,catalog=discover();chosen=next((x for x in items if x.get('slug')==args.model and x.get('visibility')=='list'),None)
-            require(chosen is not None,'所选模型不在本次当前可选目录')
-            supported=[x['effort'] for x in chosen.get('supported_reasoning_levels',[])]
-            if args.effort:require(args.effort in supported,'所选模型不支持该推理档位')
+            check_started, check_clock, check_stage = now(), time.monotonic(), 'selection'
+            try:
+                require(args.model and args.why,'模型执行需要当前候选及选择依据')
+                check_stage = 'catalog'
+                items,catalog=discover()
+                require(isinstance(items, list) and all(isinstance(item, dict) for item in items), '模型目录候选格式无效')
+                chosen=next((x for x in items if x.get('slug')==args.model and x.get('visibility')=='list'),None)
+                if chosen is None:check_stage = 'selection'
+                require(chosen is not None,'所选模型不在本次当前可选目录')
+                levels=chosen.get('supported_reasoning_levels',[])
+                require(isinstance(levels, list) and all(isinstance(level, dict) and isinstance(level.get('effort'), str) for level in levels), '模型推理档位目录格式无效')
+                supported=[level['effort'] for level in levels]
+                check_stage = 'selection'
+                if args.effort:require(args.effort in supported,'所选模型不支持该推理档位')
+            except (FlowError, OSError, ValueError, KeyError, yaml.YAMLError):
+                config = yaml.safe_load((ROOT/'.specify/flow.local.yml').read_text())
+                provider = catalog.get('provider') if catalog else config.get('provider')
+                check_id = uuid.uuid4().hex[:12]
+                put(f/'evidence'/check_id/'model-check.json', {
+                    'attempt_id': check_id, 'task_id': t['id'], 'problem_id': problem,
+                    'phase': args.phase, 'started_at': check_started, 'finished_at': now(),
+                    'execution_channel': 'codex-cli', 'provider': provider,
+                    'model': args.model, 'reasoning_effort': args.effort, 'actual_model': 'unknown',
+                    'outcome': 'not_started', 'model_observation': model_observation(
+                        stage=check_stage, elapsed=time.monotonic()-check_clock)})
+                raise
             model=args.model;effort=args.effort
         else:require(args.command in t['验证命令'],'测试命令必须在已确认任务中')
         require(5<=args.timeout<=3600,'单次超时范围 5–3600 秒')
@@ -338,10 +476,14 @@ def execute(args):
         for k,v in native_inputs.items():command+=['-i',k+'='+v]
         env=os.environ.copy();env['SPECIFY_FEATURE_DIRECTORY']=str(f.relative_to(ROOT));env['PATH']=str(Path(codex()).parent)+os.pathsep+env.get('PATH','')
         extra=['--ephemeral','--skip-git-repo-check','--sandbox','read-only' if args.phase=='review' else 'workspace-write','-C',str(repo)]
+        message_file=e/'last-message.txt'
+        if args.phase != 'test':extra+=['--json','--output-last-message',str(message_file)]
         if catalog and catalog.get('provider'):extra+=['-c','model_provider='+json.dumps(catalog['provider'])]
         if effort:extra+=['-c','model_reasoning_effort='+json.dumps(effort)]
         env['SPECKIT_INTEGRATION_CODEX_EXTRA_ARGS']=shlex.join(extra)
         protected={name:digest((f/name).read_bytes()) for name in ('spec.md','plan.md','tasks.md')}
+        call_clock = time.monotonic()
+        response_received, diagnostic, observation_stage = False, '', 'execution'
         try:
             # The child cannot dispatch before its process identity is durable.
             ready=e/'launch-ready'
@@ -350,12 +492,18 @@ def execute(args):
             record['pgid']=proc.pid;put(e/'result.json',record);atomic(ready,'ready\n')
             try:stdout,stderr=proc.communicate(timeout=args.timeout)
             except subprocess.TimeoutExpired:
+                observation_stage = 'timeout'
                 stop_group(proc);stdout,stderr=proc.communicate();raise FlowError('本次执行超时，进程组已停止；结果未知，需核对接续')
             try:native=json.loads(stdout)
             except ValueError:raise FlowError('原生执行没有返回完整结果，需核对')
             record['run_id']=native.get('run_id');require(record['run_id'],'缺少原生 run_id')
             state=read(ROOT/'.specify/workflows/runs'/record['run_id']/'state.json')
             output=state.get('step_results',{}).get('work',{}).get('output',{})
+            stopped = output.get('interrupted') or output.get('timed_out') or output.get('exit_code') in (130, -2, -15)
+            if stopped:observation_stage = 'timeout' if output.get('timed_out') else 'interrupted'
+            response_received = not stopped and proc.returncode==0 and native.get('status')=='completed' and output.get('exit_code')==0
+            diagnostic = model_diagnostics(str(output.get('stdout', '')))
+            response_text = message_file.read_text() if args.phase != 'test' and message_file.is_file() else str(output.get('stdout', ''))
             require(not alive_group(proc.pid),'原生进程已返回但子进程仍活跃；不能判完成')
             record['git_after']=git_snapshot(repo)
             outside=changed_outside(git_before,record['git_after'],t['范围'])
@@ -363,11 +511,11 @@ def execute(args):
             require(git_before['head']==record['git_after']['head'],'执行者改变了 Git HEAD，需核对')
             untouched=all(digest((f/name).read_bytes())==h for name,h in protected.items())
             require(untouched,'执行者修改了需求中心文档，必须核对，不能自动完成')
-            passed=proc.returncode==0 and native.get('status')=='completed' and output.get('exit_code')==0
-            record.update(outcome='passed' if passed else 'failed',native_status=native.get('status'),summary=str(output.get('stdout',''))[-24000:],error=None if passed else native.get('error','原生步骤未成功'))
+            passed=not stopped and proc.returncode==0 and native.get('status')=='completed' and output.get('exit_code')==0
+            record.update(outcome='passed' if passed else 'failed',native_status=native.get('status'),summary=response_text[-24000:],error=None if passed else native.get('error','原生步骤未成功'))
             if args.phase=='test':record['test_output']=str(output.get('stdout',''))[-24000:]+'\n'+str(output.get('stderr',''))[-24000:]
             if args.phase=='review' and passed:
-                try:verdict=parse_review(output.get('stdout',''))
+                try:verdict=parse_review(response_text)
                 except ValueError:verdict={}
                 record['review_approved']=review_ok(verdict)
                 if not record['review_approved']:record.update(outcome='failed',error='独立检查未批准或未返回有效结论')
@@ -382,6 +530,10 @@ def execute(args):
                 except (OSError,ValueError):pass
             if len(candidates)==1:record['run_id']=candidates[0]
         record.update(finished_at=now(),after_context=context_version(f,repo,t),after_feature_context=feature_context(f))
+        if args.phase != 'test':
+            record['model_observation'] = model_observation(diagnostic,
+                response_received=response_received, stage=observation_stage,
+                elapsed=time.monotonic()-call_clock)
         record['progress']=record['outcome']=='passed' and args.phase in ('test','review')
         put(e/'result.json',record)
         if record['outcome']=='passed':update_task(f,t['id'],状态='测试中',下一步='核对结果并完成任务，或继续必要验证',阻塞='无',证据=t['证据']+[str((e/'result.json').relative_to(f))])
@@ -529,6 +681,9 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='action',required=True)
     v=sub.add_parser('check');v.add_argument('feature');v.add_argument('--execution',action='store_true')
     sub.add_parser('models')
+    a=sub.add_parser('model-report', help='只读汇总执行通道与模型的调用观测')
+    a.add_argument('--since', help='包含此带时区 ISO 时间之后的观测')
+    a.add_argument('--until', help='不包含此带时区 ISO 时间及之后的观测')
     a=sub.add_parser('approve');a.add_argument('feature');a.add_argument('node',choices=['review','plan']);a.add_argument('--quote',required=True);a.add_argument('--source',required=True)
     a=sub.add_parser('run');a.add_argument('feature');a.add_argument('task');a.add_argument('--phase',choices=['implement','test','review'],required=True);a.add_argument('--problem');a.add_argument('--model');a.add_argument('--effort');a.add_argument('--why');a.add_argument('--command');a.add_argument('--timeout',type=int,default=300);a.add_argument('--resume');a.add_argument('--previous');
     for name in ('repair','upgrade','replan'):a.add_argument('--'+name,action='store_true')
@@ -546,6 +701,7 @@ def main():
     args=p.parse_args()
     if args.action=='models':
         items,meta=discover();result={**meta,'models':[{k:m.get(k) for k in ('slug','display_name','visibility','supported_reasoning_levels','input_modalities')} for m in items if m.get('visibility')=='list']}
+    elif args.action=='model-report':result=model_report(args)
     elif args.action=='check':
         f=feature(args.feature);s,pl,ts,r,sv,pv=validate(f,args.execution);result={'feature':args.feature,'tasks':{k:{x:v[x] for x in ('title','状态','下一步','阻塞')} for k,v in ts.items()},'spec_version':sv,'plan_version':pv}
     elif args.action=='approve':result=approval(args)

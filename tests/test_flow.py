@@ -123,7 +123,9 @@ class FlowFixture(unittest.TestCase):
                                       phase, repair, upgrade, replan)
 
     def run_fake_test(self, *, stdout=None, output=None, returncode=0,
-                      native_status='completed', resume=None, phase='test'):
+                      native_status='completed', resume=None, phase='test',
+                      stderr='', discovery_error=None, selected_model='fixture-current-model',
+                      effort=None, communicate_error=None, catalog_items=None, last_message=None):
         """Use the real execute bookkeeping with a deterministic native boundary."""
         self.approve_all()
         run_dir = self.root / '.specify/workflows/runs/fake-native-run'
@@ -136,18 +138,204 @@ class FlowFixture(unittest.TestCase):
         proc = Mock(pid=99999999, returncode=returncode)
         proc.communicate.return_value = (
             stdout if stdout is not None else json.dumps({
-                'run_id': 'fake-native-run', 'status': native_status}), '')
+                'run_id': 'fake-native-run', 'status': native_status}), stderr)
+        if communicate_error:
+            proc.communicate.side_effect = [communicate_error, ('', '')]
         args = SimpleNamespace(feature=self.feature_arg, task='T001', phase=phase,
             problem='P-shared', repair=False, upgrade=False, replan=False,
-            previous=None, resume=resume, model='fixture-current-model' if phase!='test' else None, why='fixture current catalog' if phase!='test' else None, effort=None,
+            previous=None, resume=resume, model=selected_model if phase!='test' else None, why='fixture current catalog' if phase!='test' else None, effort=effort,
             command='python -m unittest', timeout=5)
-        with patch.object(flow.subprocess, 'Popen', return_value=proc), \
+        def launch(*arguments, **options):
+            extra = flow.shlex.split(options['env']['SPECKIT_INTEGRATION_CODEX_EXTRA_ARGS'])
+            if last_message is not None:
+                self.assertIn('--json', extra)
+                Path(extra[extra.index('--output-last-message')+1]).write_text(last_message)
+            return proc
+        candidates = catalog_items if catalog_items is not None else [{'slug':'fixture-current-model','visibility':'list','supported_reasoning_levels':[]}]
+        with patch.object(flow.subprocess, 'Popen', side_effect=launch), \
              patch.object(flow, 'git_snapshot', return_value={'head': 'test', 'changes': {}}), \
              patch.object(flow, 'alive_group', return_value=False), \
              patch.object(flow, 'stop_group'), \
              patch.object(flow, 'codex', return_value='/fixture-only/bin/codex'), \
-             patch.object(flow, 'discover', return_value=([{'slug':'fixture-current-model','visibility':'list','supported_reasoning_levels':[]}],{'provider':'fixture'})):
+             patch.object(flow, 'discover', side_effect=discovery_error, return_value=(candidates,{'provider':'fixture'})):
             return flow.execute(args)
+
+
+class ModelObservationTests(FlowFixture):
+    def report(self, since=None, until=None):
+        return flow.model_report(SimpleNamespace(since=since, until=until))
+
+    def test_completed_model_response_and_review_rejection_are_separate(self):
+        output = {'exit_code': 0, 'stderr': '', 'stdout': json.dumps({
+            'approved': False, 'findings': [], 'summary': 'fixture review blocker'})}
+        result = self.run_fake_test(phase='review', output=output)
+        record = flow.records(self.f)[0]
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(record['model_observation']['call_status'], 'succeeded')
+        group = self.report()['groups'][0]
+        self.assertEqual(group['task_outcomes'], {'failed': 1})
+        self.assertEqual(group['call_success_rate']['numerator'], 1)
+        self.assertEqual(group['provider'], 'fixture')
+        self.assertEqual(group['execution_duration_samples'], 1)
+
+    def test_backend_test_failures_are_excluded_from_model_report(self):
+        self.run_fake_test(returncode=1, output={
+            'exit_code': 1, 'stdout': '', 'stderr': 'unexpected status 401 Unauthorized'})
+        self.assertNotIn('model_observation', flow.records(self.f)[0])
+        self.assertEqual(self.report()['groups'], [])
+
+    def test_agent_stdout_is_not_used_to_diagnose_model_availability(self):
+        self.run_fake_test(phase='implement', returncode=1, native_status='failed',
+                           output={'exit_code': 1, 'stdout': 'business model_not_found', 'stderr': ''})
+        self.assertEqual(flow.records(self.f)[0]['model_observation']['call_status'], 'unknown')
+
+    def test_unstructured_launcher_stderr_keeps_call_unknown(self):
+        self.run_fake_test(phase='implement', stdout='not json', returncode=1,
+                           stderr='ERROR: unexpected status code: 401 Unauthorized')
+        observation = flow.records(self.f)[0]['model_observation']
+        self.assertEqual(observation['failure_category'], 'unknown')
+        self.assertEqual(observation['call_status'], 'unknown')
+
+    def test_timeout_keeps_call_result_unknown(self):
+        self.run_fake_test(phase='implement', communicate_error=flow.subprocess.TimeoutExpired('fixture', 5))
+        observation = flow.records(self.f)[0]['model_observation']
+        self.assertEqual(observation['failure_category'], 'timeout')
+        self.assertEqual(observation['call_status'], 'unknown')
+
+    def test_review_rejection_preserves_successful_model_call(self):
+        verdict = json.dumps({'approved': False, 'findings': [
+            {'severity': 'high', 'blocking': True, 'message': 'fixture defect'}],
+            'summary': 'fixture review found a defect'})
+        result = self.run_fake_test(phase='review', output={
+            'exit_code': 0, 'stdout': verdict, 'stderr': ''})
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['model_observation']['call_status'], 'succeeded')
+
+    def test_model_failure_diagnostics_are_recorded_without_copying_raw_error(self):
+        result = self.run_fake_test(phase='implement', native_status='failed', returncode=1,
+            output={'exit_code': 1, 'stdout': json.dumps({'type': 'turn.failed',
+                    'error': {'message': 'invalid_api_key fixture-secret'}}), 'stderr': ''})
+        self.assertEqual(result['model_observation']['failure_category'], 'authentication')
+        self.assertEqual(result['model_observation']['call_status'], 'failed')
+        self.assertNotIn('fixture-secret', json.dumps(result['model_observation']))
+
+    def test_interruption_and_tool_logs_cannot_mark_model_unavailable(self):
+        for stopped in ({'exit_code': 130, 'interrupted': True},
+                        {'exit_code': -1, 'timed_out': True}, {'exit_code': 1}):
+            with self.subTest(stopped=stopped):
+                self.root.joinpath('specs/001-contract/evidence').mkdir(exist_ok=True)
+                result = self.run_fake_test(phase='implement', native_status='failed', returncode=1,
+                    output={**stopped, 'stdout': json.dumps({'type': 'item.completed', 'item': {
+                        'type': 'command_execution', 'aggregated_output': 'invalid_api_key'}}),
+                        'stderr': 'business tool invalid_api_key'})
+                self.assertEqual(result['model_observation']['call_status'], 'unknown')
+                path = next((self.f/'evidence').glob('*/result.json'))
+                path.unlink()
+
+    def test_json_event_capture_uses_last_message_for_review(self):
+        verdict = json.dumps({'approved': True, 'findings': [], 'summary': 'fixture approved'})
+        result = self.run_fake_test(phase='review', last_message=verdict,
+            output={'exit_code': 0, 'stdout': '{"type":"thread.started"}\n{truncated',
+                    'stdout_truncated': True})
+        self.assertTrue(result['review_approved'])
+        self.assertEqual(result['outcome'], 'passed')
+
+    def test_malformed_reasoning_directory_is_recorded_as_preflight_failure(self):
+        for levels in (None, {}, [None], [{'wrong': 'low'}]):
+            with self.subTest(levels=levels):
+                with self.assertRaises(flow.FlowError):
+                    self.run_fake_test(phase='implement', catalog_items=[{
+                        'slug': 'fixture-current-model', 'visibility': 'list',
+                        'supported_reasoning_levels': levels}])
+        checks = [json.loads(path.read_text()) for path in (self.f/'evidence').glob('*/model-check.json')]
+        self.assertEqual(len(checks), 4)
+        self.assertEqual(flow.records(self.f), [])
+        self.assertTrue(all(row['model_observation']['failure_category']=='catalog' for row in checks))
+
+    def test_catalog_and_selection_failures_leave_evidence_without_task_execution(self):
+        cases = (
+            ({'discovery_error': flow.FlowError('fixture catalog unavailable')}, 'catalog'),
+            ({'selected_model': 'fixture-missing-model'}, 'selection'),
+            ({'effort': 'fixture-unsupported-effort'}, 'selection'),
+        )
+        for arguments, expected in cases:
+            with self.subTest(expected=expected, arguments=arguments):
+                before = (self.f/'tasks.md').read_bytes()
+                with self.assertRaises(flow.FlowError):
+                    self.run_fake_test(phase='implement', **arguments)
+                self.assertEqual(flow.records(self.f), [])
+                self.assertEqual((self.f/'tasks.md').read_bytes(), before)
+        checks = list((self.f/'evidence').glob('*/model-check.json'))
+        self.assertEqual(len(checks), 3)
+        group = self.report()['groups']
+        self.assertEqual(sum(item['calls']['not_started'] for item in group), 3)
+        self.assertTrue(all(item['call_success_rate']['value'] is None for item in group))
+        self.assertEqual(sum(item['preflight_duration_samples'] for item in group), 3)
+
+    def test_legacy_unknowns_and_partial_records_do_not_inflate_success_rate(self):
+        self.evidence(phase='implement', model='fixture-model', execution_channel='codex-cli',
+                      finished_at='2026-11-10T00:00:03+00:00')
+        self.evidence(phase='implement', model='fixture-model', execution_channel='codex-cli',
+                      model_observation=flow.model_observation(response_received=True, elapsed=2))
+        self.evidence(phase='implement', model='fixture-model', execution_channel='codex-cli',
+                      outcome='pending', progress=False)
+        group = self.report()['groups'][0]
+        self.assertEqual(group['calls'], {'succeeded': 1, 'failed': 0, 'unknown': 2, 'not_started': 0})
+        self.assertEqual(group['call_success_rate']['denominator'], 1)
+        self.assertEqual(group['execution_duration_samples'], 2)
+        self.assertEqual(group['actual_model_unknown'], 3)
+
+    def test_report_groups_by_channel_provider_phase_and_effort(self):
+        for channel, provider, phase, effort in (
+            ('codex-cli', 'fixture-one', 'implement', 'low'),
+            ('native-codex-subagent', 'fixture-one', 'implement', 'low'),
+            ('codex-cli', 'fixture-two', 'implement', 'low'),
+            ('codex-cli', 'fixture-one', 'review', 'low'),
+            ('codex-cli', 'fixture-one', 'implement', 'high'),
+        ):
+            self.evidence(phase=phase, execution_channel=channel, model='fixture-model',
+                          catalog={'provider': provider}, reasoning_effort=effort)
+        self.assertEqual(len(self.report()['groups']), 5)
+
+    def test_invalid_record_is_reported_without_partial_group_mutation(self):
+        self.evidence(phase='implement', model='fixture-model', outcome=['invalid'])
+        self.evidence(phase='implement', model='fixture-model')
+        corrupt = self.f/'evidence/corrupt/result.json'
+        corrupt.parent.mkdir()
+        corrupt.write_text('{')
+        report = self.report()
+        self.assertEqual(report['groups'][0]['observations'], 1)
+        self.assertEqual(len(report['unreadable_records']), 2)
+
+    def test_report_cli_uses_half_open_timezone_aware_window_without_writes(self):
+        for second in (1, 2, 3):
+            self.evidence(phase='implement', started_at=f'2026-11-10T00:00:0{second}+00:00')
+        before = {str(path): path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        argv = ['flow.py', 'model-report', '--since', '2026-11-10T08:00:02+08:00',
+                '--until', '2026-11-10T08:00:03+08:00']
+        with patch.object(sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(flow.main(), 0)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report['groups'][0]['observations'], 1)
+        self.assertTrue(report['sources'][0]['path'].endswith('attempt-002/result.json'))
+        after = {str(path): path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        self.assertEqual(before, after)
+        for since, until in (('2026-11-10', None), ('bad', None),
+                             ('2026-11-11T00:00:00Z', '2026-11-10T00:00:00Z')):
+            with self.assertRaises(flow.FlowError):
+                self.report(since, until)
+
+
+class ModelDiagnosticTests(unittest.TestCase):
+    def test_failure_signatures_and_success_precedence(self):
+        for diagnostic, expected in (
+            ('invalid_api_key', 'authentication'), ('rate_limit_exceeded', 'rate_limit'),
+            ('model_not_found', 'model_unavailable'), ('tools are not supported', 'tool_compatibility'),
+            ('error sending request for url', 'connection'), ('generic task failure', 'unknown'),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(flow.model_observation(diagnostic)['failure_category'], expected)
+                self.assertEqual(flow.model_observation(diagnostic, response_received=True)['call_status'], 'succeeded')
 
 
 class TaskFormatTests(FlowFixture):
